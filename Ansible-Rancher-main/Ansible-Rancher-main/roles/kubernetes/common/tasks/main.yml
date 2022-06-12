@@ -1,0 +1,133 @@
+﻿---
+- name: Update netplan
+  template:
+    src: 'KubernetesNetplan.yaml'
+    dest: /etc/netplan/50-kubernetes-netplan.yaml
+    owner: root
+    group: root
+    mode: 0644
+  when: InitialSetup
+
+- name: Remove default netplan
+  file:
+    state: absent
+    path: /etc/netplan/99-setup.yaml
+  when: InitialSetup
+
+- name: Apply netplan
+  shell: netplan apply
+  when: InitialSetup
+
+- name: Disable Swap
+  lineinfile:
+    path: /etc/fstab
+    line: '# \1'
+    regexp: '^(/swap\.img\s*none\s*swap\s*sw\s*0\s*0)'
+
+- name: Create Docker partition
+  parted:
+    device: '{{ vm_dockerdrive }}'
+    number: 1
+    flags: [ lvm ]
+    state: present
+  when: InitialSetup
+
+- name: Create Docker VG
+  lvg:
+    vg: docker-vg
+    pvs: '{{ vm_dockerdrive }}1'
+    pesize: 255GB
+  when: InitialSetup
+
+- name: Create Docker LV
+  lvol:
+    vg: docker-vg
+    lv: docker-lv
+    size: 255g
+    force: yes
+  when: InitialSetup
+
+- name: Format Docker LV
+  filesystem:
+    fstype: ext4
+    dev: /dev/docker-vg/docker-lv
+  when: InitialSetup
+
+- name: Create Docker mount point
+  file:
+    path: /var/lib/docker
+    state: directory
+    mode: '0755'
+  when: InitialSetup
+
+- name: Mount Docker LV
+  ansible.builtin.mount:
+    path: /var/lib/docker
+    src: /dev/docker-vg/docker-lv
+    fstype: ext4
+    state: mounted
+  when: InitialSetup
+
+- name: Enable bridge traffic for Kubernetes vNICs
+  community.general.ufw:
+    rule: allow
+    interface: '{{ item.interface }}'
+    direction: '{{ item.direction }}'
+  loop:
+    - { interface: 'cali+',    direction: 'in'  }
+    - { interface: 'cali+',    direction: 'out' }
+    - { interface: 'cni+',     direction: 'in'  }
+    - { interface: 'cni+',     direction: 'out' }
+    - { interface: 'flannel+', direction: 'in'  }
+    - { interface: 'flannel+', direction: 'out' }
+  register: result
+  retries: 3
+  delay: 1
+  until: result is not failed
+
+- name: determine if docker is installed
+  command: which docker
+  register: docker_installed
+  ignore_errors: true
+  changed_when: false
+
+- name: get docker version
+  shell: docker --version | awk '{ print $3 }'
+  register: docker_installed_version
+  when: docker_installed
+  changed_when: false
+
+- name: Download Rancher Docker Install script
+  get_url:
+    url: https://releases.rancher.com/install-docker/{{ docker_Version }}.sh
+    checksum: '{{ rancher_Dockersh256 }}'
+    dest: /tmp/install-docker.sh
+    owner: root
+    group: root
+    mode: 0755
+  when: not docker_installed.rc == 0 or
+        not docker_installed_version.stdout is search(docker_Version|string)
+  register: docker_install_script_downloaded
+
+- name: Install Docker
+  shell: /tmp/install-docker.sh
+  when: docker_install_script_downloaded and
+        not docker_installed.rc == 0
+
+- name: Validate Kubernetes repo added
+  stat:
+    path: /usr/local/share/aptgpgkeys/kubernetes.gpg
+  register: kubernetesgpgkey
+
+- name: Install Kubernetes
+  script: files/Install-Kubernetes.sh
+  when: not kubernetesgpgkey.stat.exists
+
+- name: Validate Helm repo added
+  stat:
+    path: /usr/local/share/aptgpgkeys/helm.gpg
+  register: helmgpgkey
+
+- name: Install Helm
+  script: files/Install-Helm.sh
+  when: not helmgpgkey.stat.exists
